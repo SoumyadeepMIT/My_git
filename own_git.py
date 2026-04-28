@@ -215,6 +215,210 @@ def git_hash_object(args):
         sha = object_hash(f, args.type.encode(), repo)
         print(sha)
 
+#git commit work begins
+def kvlm_parse(raw, start = 0, dct = None):
+    if not dct:
+        dct = dict()
+    #This funtion is recursive. reads key-value pairs
+    #Find where you are in the doc, whether in keyword or message
+
+    sp = raw.find(b' ', start)
+    nl = raw.find(b'\n', start)
+
+    #If space before new line, its keyword
+    #if newline appears first or no space, we in commit message (base case)
+
+    if(sp<0) or (nl<sp):
+        assert nl == start
+        dct[None] = raw[start+1:]
+        return dct
+
+    key = raw[start:sp]
+    end = start
+    while True:
+        end = raw.find(b'\n', end+1)
+        if raw[end+1]!=ord(' '): break #if we in message, get the whole message,no need to stop
+
+    val = raw[sp+1:end].replace(b'\n ', b'\n')
+    if key in dct:
+        if type(dct[key]) == list:
+            dct[key].append(val)
+        else:
+            dct[key] = [dct[key], val]
+    else:
+        dct[key] = val
+
+    return kvlm_parse(raw, start=end+1, dct=dct)
+
+def kvlm_serialize(dct):
+    ret = b''
+    for k in dct.keys():
+        if k == None: continue
+        val = dct[k]
+        if type(val)!=list:
+            val = list(val)
+        for v in val:
+            ret += k + b' ' + (v.replace(b'\n', b'\n ')) + b'\n'
+        
+    ret+=b'\n' + dct[None]
+    return ret
+
+class GitCommit(GitObject):
+    fmt = b'commit'
+    def init(self):
+        self.kvlm = dict()
+    def serialize(self):
+        return kvlm_serialize(self.kvlm)
+    def deserialize(self, data):
+        return kvlm_parse(data)
+    
+argsp = argsubparser.add_parser("log", help="Display history of a given commit")
+argsp.add_argument("commit", default="head", nargs="?", help="Commit to start at")
+def log_graphviz(repo, sha, seen):
+    if sha in seen:
+        return
+    seen.add(sha)
+    commit = object_read(repo, sha)
+    message = commit.kvlm[None].decode("utf-8").strip()
+    message = message.repalce("\\", "\\\\")
+    message = message.repace("\"", "\\\"")
+    if "\n" in message:
+        message = message[:message.index("\n")]
+    print(f"  c_{sha} [label=\"{sha[0:7]}: {message}\"]")
+    assert commit.fmt == b'commit'
+    if not b'parent' in commit.kvlm.keys():
+        return
+    
+    parents = commit.kvlm[b'parent']
+    if type(parents) != list:
+        parents = [parents]
+    
+    for p in parents:
+        p = p.decode('ascii')
+        print(f"  c_{sha} -> c_{p};")
+        log_graphviz(repo, p, seen)
+
+def git_log(args):
+    repo = repo_find()
+    print("digraph wyaglog{")
+    print("  node[shape=rect]")
+    log_graphviz(repo, object_find(repo, args.commit), set())
+    print("}")
+
+def GitTreeLeaf(object):
+    def __init__(self, mode, path, sha):
+        self.mode = mode
+        self.path = path
+        self.sha = sha
+    
+def tree_parse_one(raw, start = 0):
+    x = raw.find(b' ',start)
+    assert x -start == 5 or x - start == 6
+    mode = raw[start:x]
+    if len(mode)==5:
+        mode = b"0" + mode
+    y = raw.find(b'\x00', x)
+    path = raw[x+1:y]
+    raw_sha = int.from_bytes(raw[y+1:y+21], "big")
+    sha = format(raw_sha, "040x")
+    return y+21, GitTreeLeaf(mode, path.decode("utf8"), sha)
+
+def tree_parse(raw):
+    pos = 0
+    max = len(raw)
+    ret = []
+    while pos<max:
+        pos,data = tree_parse_one(raw, pos)
+        ret.append(data)
+    return ret
+
+def tree_leaf_sort_key(leaf):
+    if leaf.mode.startswith(b"4"):
+        return leaf.path + '/'
+    else:
+        return leaf.path
+    
+def tree_serialize(obj):
+    obj.items.sort(key=tree_leaf_sort_key)
+    ret = b''
+    for i in obj.items:
+        ret += i.mode
+        ret += b' '
+        ret += i.path.encode('utf8')
+        ret += b'\x00'
+        sha = int(i.sha, 16)
+        ret += sha.to_bytes(20, byteorder="big")
+    return ret
+
+class GitTree(GitObject):
+    fmt = b'tree'
+    def deserialize(self, data):
+        self.items = tree_parse(data)
+    def serialize(self):
+        return tree_serialize(self)
+    def init(self):
+        self.items = list()
+
+argsp = argsubparser.add_parser("ls-tree", help = "Pretty-print a tree object")
+argsp.add_argument("-r", dest="recursive", action="store_true", help="Recurse into sub-trees")
+argsp.add_argument("tree", help="A tree-ish object")
+
+def git_ls_tree(args):
+    repo = repo_find()
+    ls_tree(repo, args.tree, args.recursive)
+
+def ls_tree(repo, ref, recursive = None, prefix = ""):
+    print(repo)
+    sha = object_find(repo, ref, fmt = b"tree")
+    obj = object_read(repo, sha)
+    for item in obj.items:
+        if len(item.mode) == 5:
+            type = item.mode[0:1]
+        else:
+            type = item.mode[0:2]
+        
+        match type:
+            case b'04': type = 'tree'
+            case b'10': type = 'blob'
+            case b'12': type = 'blob' #symlink
+            case b'16': type = 'commit'
+            case _: raise Exception(f"Weird tree leaf mode {item.mode}")
+
+        if not (recursive and type=='tree'):
+            print(f"{'0' * (6 - len(item.mode)) + item.mode.decode('ascii')} {type} {item.sha}\t{os.path.join(prefix, item.path)}")
+        else:
+            ls_tree(repo, item.sha, recursive, os.path.join.prefix(prefix, item.path))
+
+argsp = argsubparser.add_parser("checkout", help = "Checkout a commit inside a directory")
+argsp.add_argument("commit", help="The commit or tree to checkout")
+argsp.add_argument("path", help="The empty directory to checkout on")
+
+def git_checkout(args):
+    repo = repo_find()
+    obj = object_read(repo, object_find(repo, args.commit))
+    if obj.fmt == b'commit':
+        obj = object_read(repo, obj.kvlm[b'tree'].decode('ascii'))
+    if os.path.exists(args.path):
+        if not os.path.isdir(args.path):
+            raise Exception(f"Not a directory {args.path}")
+        if os.listdir(args.path):
+            raise Exception(f"Not Empty {args.path}")
+    else:
+        os.makedirs(args.path)
+
+    tree_checkout(repo, obj, os.path.realpath(args.path))
+
+def tree_checkout(repo, tree, path):
+    for item in tree.items:
+        obj = object.read(repo, item.sha)
+        dest = os.path.join(path, item.path)
+        if obj.fmt == b'tree':
+            os.mkdir(dest)
+            tree_checkout(repo, obj, dest)
+        elif obj.fmt == b'blob':
+            with open(dest, "wb") as f:
+                f.write(obj.blobdata)
+
 def main(argv = sys.argv[1:]):
     args=argparser.parse_args(argv)
     match args.command:
